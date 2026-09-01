@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    image: divine-will:latest
+    container_name: divine-will-web
+    restart: unless-stopped
+    # No host ports published — reached only via kannanware's nginx,
+    # which proxies to this container by name over the shared network below.
+    networks:
+      - shared_web
+
+networks:
+  shared_web:
+    external: true
