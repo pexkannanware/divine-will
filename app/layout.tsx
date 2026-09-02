@@ -15,7 +15,7 @@ const manrope = Manrope({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://thedivinewill.example"),
+  metadataBase: new URL("https://thedivinewill.in"),
   title: {
     default: "The Divine Will",
     template: "%s | The Divine Will",
