@@ -1,0 +1,21 @@
+name: divine-will
+services:
+  web:
+    image: divine-will:latest
+    container_name: divine-will-web
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(async r => { const b = await r.json(); if (!r.ok || b.status !== 'ok' || b.revision !== process.env.DEPLOY_REVISION) process.exit(1); }).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - shared_web
+networks:
+  shared_web:
+    external: true

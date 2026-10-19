@@ -6,3 +6,5 @@ out
 .env*
 !.env.example
 .vercel
+
+__pycache__/

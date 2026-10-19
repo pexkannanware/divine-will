@@ -1,192 +1,97 @@
-# Deploy thedivinewill.in — same droplet as kannanware, separate container
+# Automatic DigitalOcean deployment
 
-This site runs in its own Docker container (`divine-will-web`), fully independent from the
-`s4hana-elevate-*` containers (own image, own restarts, own volumes — none shared). It shares
-only two things with kannanware on the droplet: the public IP, and the front-door nginx
-(inside kannanware's `web` container) that owns ports 80/443 and routes by domain name.
+Push to `main` to build and deploy, or run **Deploy DigitalOcean** manually from
+GitHub Actions with `main` selected. Other branches cannot deploy.
 
-## 1) Copy the project to the droplet
+## Confirmed production settings
 
-From your Mac:
+| Setting | Value |
+| --- | --- |
+| Repository | `pexkannanware/divine-will` |
+| Website | https://thedivinewill.in |
+| SSH destination | `root@178.128.102.157` |
+| Architecture | `linux/amd64` |
+| Application / Compose project | `/var/www/divine-will` / `divine-will` |
+| Service / container | `web` / `divine-will-web` |
+| Image | `divine-will:<40-character commit SHA>`; active alias `divine-will:latest` |
+| Shared network | Existing external network `shared_web` |
+| Shared nginx Compose directory | `/var/www/s4hana-elevate/kannanwarerevamp` |
 
-```bash
-rsync -avz --exclude node_modules --exclude .next --exclude .vercel \
-  "/Users/santhosh/Desktop/divine-will/" your-user@droplet-ip:/var/www/divine-will/
-```
+The Next.js standalone image builds with Node 22.22.0. No application secrets or
+custom environment variables are required by the source. The image sets
+`NODE_ENV`, `PORT`, `HOSTNAME`, and the build argument `DEPLOY_REVISION`.
+Google Fonts require network access during the build. `.env*` files are excluded
+from the Docker build context; local environment files are never transferred.
 
-(Or `git init` this folder, push to a new GitHub repo, and `git clone` it on the droplet
-instead — whichever you prefer. `rsync` is fastest for a first deploy.)
+## GitHub settings
 
-## 2) Create the shared Docker network (one-time, only if it doesn't exist yet)
+Actions must be enabled. Under **Settings → Secrets and variables → Actions**, set:
 
-```bash
-docker network create shared_web
-```
+- `DO_SSH_PRIVATE_KEY`: the dedicated `github-divine-will-deploy` OpenSSH private key.
+  Its public key is authorized on this Droplet; keep the private key only in secrets.
+- `DO_SSH_KNOWN_HOSTS`: the verified host entry for `178.128.102.157`.
+  Obtain this from a trusted administrator or compare its fingerprint through the
+  DigitalOcean console before changing it. Never bypass host verification.
 
-This is what lets kannanware's nginx reach this container by name without publishing any
-port for it on the host.
+Both secrets have been configured for this repository. No repository variables,
+registry credentials, published application ports, or server-side git credentials
+are needed. The dedicated key provides root SSH access for Docker deployment;
+only trusted maintainers should be able to modify `main` or run workflows.
 
-## 3) Attach kannanware's `web` service to that network
+## Deployment behavior
 
-Edit `/var/www/s4hana-elevate/kannanwarerevamp/docker-compose.yml` — add `networks:` to the
-`web` service (keep `default` so it can still reach `wordpress` as before) and declare the
-external network at the bottom of the file:
+`.github/workflows/deploy-digitalocean.yml` builds on GitHub's amd64 runner, tags the
+image with the commit SHA, compresses a Docker archive, then transfers it with
+strict SSH host verification. Deployments are queued using Actions concurrency
+and serialized with `/var/www/divine-will/.deploy.lock` on the server.
+Nginx operations also hold `/var/lock/shared-web-proxy.lock`; other deployment
+scripts must use this lock to coordinate their own proxy reloads.
 
-```yaml
-services:
-  web:
-    # ...existing config unchanged...
-    networks:
-      - default
-      - shared_web
+`scripts/deploy-droplet.sh` checks the existing container's working directory,
+Compose project and service labels before modifying it. It saves the previous
+Compose file and image ID under `releases/<SHA>-<run ID>-<attempt>/`, retaining the
+image with `divine-will:rollback-<SHA>`. It installs `docker-compose.production.yml`
+as the server's `docker-compose.yml`, updates only `web`, and waits for its HTTP
+health check. It then tests and reloads nginx, verifies the HTTPS homepage, and
+checks that `/api/health` returns the new SHA. Only then does it atomically write
+`.deployed-revision`.
 
-networks:
-  shared_web:
-    external: true
-```
+Failures after replacement restore the previous Compose file and image alias,
+recreate only this app, and test/reload nginx again. Failed rollbacks are clearly
+reported in Actions logs. The archive is deleted on script exit. Image backups
+and release metadata remain for manual recovery; there is no global Docker
+cleanup. Monitor disk space and remove only reviewed, obsolete Divine Will
+releases/images when necessary. The current Droplet has limited free disk space.
+The script requires Linux, Bash, flock, curl, Docker, and Docker Compose v2+.
 
-Apply it (this briefly recreates only the `web` container — a few seconds of downtime for
-kannanware, same as any normal redeploy):
+A failed Actions run may be rerun; each attempt uses a separate release directory.
+For manual recovery, inspect the failed release's `previous-image` and
+`previous-compose.yml`, retag that saved image as `divine-will:latest`, restore the
+saved Compose file, and run the same service-only Compose update under the deploy
+lock. Test and reload the proxy afterward. The saved previous image's original
+revision can be checked through `/api/health` if it has that endpoint (the initial
+legacy image does not). Do not use `docker compose down` or global prune commands.
 
-```bash
-cd /var/www/s4hana-elevate/kannanwarerevamp
-docker compose up -d web
-```
-
-## 4) Build and start the divine-will container
-
-```bash
-cd /var/www/divine-will
-docker compose up -d --build
-```
-
-It won't be reachable from the internet yet — no host port is published, no nginx route
-exists for it yet. That's expected.
-
-## 5) DNS
-
-In your DNS provider for `thedivinewill.in`, add A records pointing at the same droplet IP
-kannanware uses:
-
-- `A` record: `thedivinewill.in` → droplet IP
-- `A` record: `www.thedivinewill.in` → droplet IP
-
-Wait for propagation (`dig thedivinewill.in`) before the next step.
-
-## 6) Add an HTTP-only nginx route first (needed for the cert challenge)
-
-Edit `/var/www/s4hana-elevate/kannanwarerevamp/nginx.conf` and append this new `server`
-block (don't touch anything else in the file):
-
-```nginx
-server {
-    listen 80;
-    listen [::]:80;
-    server_name thedivinewill.in www.thedivinewill.in;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-        try_files $uri =404;
-    }
-
-    location / {
-        proxy_pass http://divine-will-web:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-Reload:
+## Validation and verification
 
 ```bash
-cd /var/www/s4hana-elevate/kannanwarerevamp
-docker compose exec web nginx -t
-docker compose exec web nginx -s reload
+actionlint
+bash -n scripts/deploy-droplet.sh
+shellcheck scripts/deploy-droplet.sh
+python3 -m unittest discover -s tests -v
+docker compose -f docker-compose.production.yml config --quiet
+npm run typecheck
+docker build --platform linux/amd64 --build-arg DEPLOY_REVISION="$(git rev-parse HEAD)" -t divine-will:check .
+curl --fail https://thedivinewill.in/api/health
 ```
 
-Check `http://thedivinewill.in` loads the Next.js site over plain HTTP at this point.
+The isolated deployment tests execute the actual Bash script with Docker/HTTP
+command doubles: success, failed health, failed public HTTPS, mismatched public
+revision, and refusal to replace a container owned by another site. They do not
+restart the production site. Actions performs the real production Docker build,
+Compose validation, container health check, and public revision check.
 
-## 7) Issue the SSL certificate
-
-Reuses the same `certbot` sidecar and shared `letsencrypt`/`certbot-webroot` volumes
-kannanware already has running — no new certbot setup needed.
-
-```bash
-cd /var/www/s4hana-elevate/kannanwarerevamp
-docker compose exec certbot certbot certonly --webroot -w /var/www/certbot \
-  -d thedivinewill.in -d www.thedivinewill.in
-```
-
-## 8) Switch the nginx block to HTTPS
-
-Replace the `server` block you added in step 6 with these two blocks (redirect + real
-HTTPS block):
-
-```nginx
-server {
-    listen 80;
-    listen [::]:80;
-    server_name thedivinewill.in www.thedivinewill.in;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-        try_files $uri =404;
-    }
-
-    location / {
-        return 301 https://thedivinewill.in$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name thedivinewill.in www.thedivinewill.in;
-
-    ssl_certificate /etc/letsencrypt/live/thedivinewill.in/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/thedivinewill.in/privkey.pem;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    location / {
-        proxy_pass http://divine-will-web:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-Reload again:
-
-```bash
-docker compose exec web nginx -t
-docker compose exec web nginx -s reload
-```
-
-Renewal is automatic — the existing `certbot` sidecar's 12h renew loop and `web`'s 12h nginx
-reload (see kannanware's `DEPLOY_DIGITALOCEAN_DROPLET.md` §11) already cover any cert in the
-shared `letsencrypt` volume, this one included. Nothing extra to configure.
-
-## 9) Verify
-
-```bash
-curl -I https://thedivinewill.in
-curl -I https://kannanware.com   # confirm kannanware still fine
-```
-
-## Future updates (after source changes)
-
-```bash
-cd /var/www/divine-will
-git pull            # or re-rsync
-docker compose up -d --build
-```
-
-Kannanware's containers are never touched by this flow.
+The existing shared nginx routes and TLS certificates are already provisioned;
+this workflow never edits their configuration or restarts other hosted services.
+Verify https://kannanware.com, https://keaasglobal.com and https://kapplabs.com after
+deploying. `kannanware.in` failed DNS resolution during the initial baseline check.

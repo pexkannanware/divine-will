@@ -1,0 +1,74 @@
+name: Deploy DigitalOcean
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: divine-will-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DO_HOST: 178.128.102.157
+      DO_USER: root
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Validate deployment script
+        run: |
+          python3 -m unittest discover -s tests -v
+          bash -n scripts/deploy-droplet.sh
+          shellcheck scripts/deploy-droplet.sh
+          docker compose -f docker-compose.production.yml config --quiet
+      - name: Build amd64 production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: DEPLOY_REVISION=${{ github.sha }}
+          tags: divine-will:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/divine-will.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Prepare verified SSH connection
+        env:
+          DEPLOY_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DO_SSH_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/divine-will"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/divine-will" >/dev/null
+          ssh-keygen -F "$DO_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null
+          cat > "$HOME/.ssh/config" <<CONFIG
+          Host divine-will-droplet
+            HostName $DO_HOST
+            User $DO_USER
+            IdentityFile ~/.ssh/divine-will
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ConnectTimeout 15
+            ServerAliveInterval 15
+            ServerAliveCountMax 4
+          CONFIG
+      - name: Transfer and deploy
+        run: |
+          release="/var/www/divine-will/releases/$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          gzip -1 /tmp/divine-will.tar
+          # shellcheck disable=SC2029
+          ssh divine-will-droplet "mkdir -p '$release'"
+          scp /tmp/divine-will.tar.gz "divine-will-droplet:$release/image.tar.gz"
+          scp docker-compose.production.yml scripts/deploy-droplet.sh "divine-will-droplet:$release/"
+          # shellcheck disable=SC2029
+          ssh divine-will-droplet "bash '$release/deploy-droplet.sh' '$release' '$GITHUB_SHA'"
+      - name: Remove runner SSH credentials
+        if: always()
+        run: rm -f "$HOME/.ssh/divine-will"
